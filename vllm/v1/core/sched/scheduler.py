@@ -708,11 +708,11 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
-            num_new_tokens = self._cap_at_kvpress_boundary(
-                request, request.num_computed_tokens, num_new_tokens
-            )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
+            )
+            num_new_tokens = self._cap_at_kvpress_boundary(
+                request, request.num_computed_tokens, num_new_tokens
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -1158,9 +1158,6 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
-                    num_new_tokens = self._cap_at_kvpress_boundary(
-                        request, num_computed_tokens, num_new_tokens
-                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1174,6 +1171,11 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                    num_new_tokens = self._cap_at_kvpress_boundary(
+                        request, num_computed_tokens, num_new_tokens
+                    )
+                    if num_new_tokens == 0:
+                        break
                     assert num_new_tokens > 0
 
                     # Apply Mamba alignment before encoder caps.
@@ -2035,19 +2037,24 @@ class Scheduler(SchedulerInterface):
     def _cap_at_kvpress_boundary(
         request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """End prefill chunks where the kvpress-compressed span ends, and never inside
-        its observation window, so the final chunk holds every window query.
+        """Shape prefill chunks around the kvpress-compressed span.
+
+        Apply after the token-budget caps. A chunk ends exactly where the span ends
+        and never inside its observation window, so the final chunk holds every
+        window query. If the budget cannot fit the rest of the window, returns 0 and
+        the request waits for a later step.
         """
         if request.kvpress is None or request.num_evicted_tokens:
             return num_new_tokens
         end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
         window_start = end - request.kvpress.get("window_size", 64)
         chunk_end = num_computed_tokens + num_new_tokens
-        if num_computed_tokens < end < chunk_end:
+        if num_computed_tokens >= end or chunk_end <= window_start:
+            return num_new_tokens
+        if chunk_end >= end:
             return end - num_computed_tokens
-        if num_computed_tokens < window_start < chunk_end < end:
-            return window_start - num_computed_tokens
-        return num_new_tokens
+        # The chunk would end inside the window
+        return max(window_start - num_computed_tokens, 0)
 
     def _apply_kvpress_evictions(self, scheduler_output: SchedulerOutput) -> None:
         """Free the blocks the worker emptied by compacting KV in this step."""
