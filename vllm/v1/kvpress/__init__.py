@@ -21,7 +21,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.kvpress import triton_compact
+from vllm.v1.kvpress import triton_compact, triton_snapkv
 
 
 def get_config(sampling_params: Any) -> dict | None:
@@ -73,7 +73,9 @@ def get_plan() -> list[PressEntry]:
 def snapkv_scores(
     queries: torch.Tensor, keys: torch.Tensor, window_size: int, kernel_size: int
 ) -> torch.Tensor:
-    """SnapKV scores for one request, matching kvpress SnapKVPress.score.
+    """Torch reference of triton_snapkv.snapkv_scores (used in tests).
+
+    SnapKV scores for one request, matching kvpress SnapKVPress.score.
 
     queries: (window_size, num_heads, head_size), post-RoPE.
     keys: (num_kv_heads, seq_len, head_size), post-RoPE.
@@ -122,18 +124,13 @@ def apply(
     attn_metadata: Any,
 ) -> None:
     """Score and compact the planned requests right after this layer's attention."""
-    head_size = query.shape[-1]
     for e in _plan:
         block_ids = attn_metadata.block_table[e.batch_idx]
-        n_blocks = math.ceil(e.seq_len / kv_cache.shape[2])
-        keys = kv_cache[block_ids[:n_blocks], :, :, :head_size]
-        keys = keys.permute(1, 0, 2, 3).reshape(kv_cache.shape[1], -1, head_size)[
-            :, : e.seq_len
-        ]
-        scores = snapkv_scores(
+        scores = triton_snapkv.snapkv_scores(
             query[e.query_end - e.window_size : e.query_end],
-            keys,
-            e.window_size,
+            kv_cache,
+            block_ids,
+            e.seq_len,
             e.kernel_size,
         )
         keep = scores.topk(e.n_kept, dim=-1).indices.sort(dim=-1).values
