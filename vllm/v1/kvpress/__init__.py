@@ -21,6 +21,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from vllm.v1.kvpress import triton_compact
+
 
 def get_config(sampling_params: Any) -> dict | None:
     extra_args = getattr(sampling_params, "extra_args", None) or {}
@@ -96,7 +98,7 @@ def snapkv_scores(
 def compact(
     kv_cache: torch.Tensor, block_ids: torch.Tensor, seq_len: int, keep: torch.Tensor
 ) -> None:
-    """Move each head's kept KV pairs to the front of the request's blocks.
+    """Torch reference of triton_compact.compact (used in tests).
 
     kv_cache: (num_blocks, num_kv_heads, block_size, C) with K and V packed in C.
     keep: (num_kv_heads, n_kept) token indices, sorted per head.
@@ -135,4 +137,4 @@ def apply(
             e.kernel_size,
         )
         keep = scores.topk(e.n_kept, dim=-1).indices.sort(dim=-1).values
-        compact(kv_cache, block_ids, e.seq_len, keep)
+        triton_compact.compact(kv_cache, block_ids, keep)
