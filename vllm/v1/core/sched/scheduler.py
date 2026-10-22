@@ -2035,12 +2035,18 @@ class Scheduler(SchedulerInterface):
     def _cap_at_kvpress_boundary(
         request: Request, num_computed_tokens: int, num_new_tokens: int
     ) -> int:
-        """End a prefill chunk exactly where the kvpress-compressed span ends."""
+        """End prefill chunks where the kvpress-compressed span ends, and never inside
+        its observation window, so the final chunk holds every window query.
+        """
         if request.kvpress is None or request.num_evicted_tokens:
             return num_new_tokens
         end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
-        if num_computed_tokens < end < num_computed_tokens + num_new_tokens:
+        window_start = end - request.kvpress.get("window_size", 64)
+        chunk_end = num_computed_tokens + num_new_tokens
+        if num_computed_tokens < end < chunk_end:
             return end - num_computed_tokens
+        if num_computed_tokens < window_start < chunk_end < end:
+            return window_start - num_computed_tokens
         return num_new_tokens
 
     def _apply_kvpress_evictions(self, scheduler_output: SchedulerOutput) -> None:
