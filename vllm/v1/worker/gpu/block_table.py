@@ -74,6 +74,12 @@ class BlockTables:
         self.input_block_tables: list[torch.Tensor] = [
             torch.zeros_like(b.gpu) for b in self.block_tables
         ]
+        # kvpress per-head paging reads all groups at once: keep same-shaped input
+        # block tables as views of one [num_kv_cache_groups, ...] tensor.
+        self.input_block_table_stack: torch.Tensor | None = None
+        if len({tuple(b.gpu.shape) for b in self.block_tables}) == 1:
+            self.input_block_table_stack = torch.stack(self.input_block_tables)
+            self.input_block_tables = list(self.input_block_table_stack.unbind(0))
 
         self.slot_mappings = torch.zeros(
             self.num_kv_cache_groups,
@@ -120,8 +126,10 @@ class BlockTables:
         overwrite: bool,
     ) -> None:
         for i in range(self.num_kv_cache_groups):
-            start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
+            if not block_ids and not overwrite:
+                continue  # common with many groups (kvpress per-layer / per-head)
+            start = self.num_blocks.np[i, req_index] if not overwrite else 0
             if self.redirect_writes_to_null_block:
                 block_ids = [0] * len(block_ids)
             end = start + len(block_ids)

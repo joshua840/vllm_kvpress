@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+import numpy as np
+
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -15,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
@@ -178,6 +181,24 @@ class KVCacheCoordinator(ABC):
         self.group_block_sizes = tuple(
             manager.block_size for manager in self.single_type_managers
         )
+        # Full attention never skips blocks. Without prefix caching its allocation
+        # is a plain "cdiv(num_tokens - evicted, block_size) - len(blocks)", so
+        # many groups (kvpress: one per layer or per (layer, head)) are handled
+        # with numpy instead of one Python call per group.
+        self.full_attention_only = all(
+            type(manager) is FullAttentionManager
+            for manager in self.single_type_managers
+        )
+        self.vectorized_allocation = (
+            self.full_attention_only
+            and not enable_caching
+            and len(self.single_type_managers) > 1
+        )
+        # request_id -> blocks per group, for the vectorized allocation
+        self.kvpress_num_blocks: dict[str, np.ndarray] = {}
+        self.no_new_blocks: tuple[Sequence[KVCacheBlock], ...] = tuple(
+            () for _ in self.single_type_managers
+        )
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -231,6 +252,9 @@ class KVCacheCoordinator(ABC):
             The number of blocks to allocate.
 
         """
+        if self.vectorized_allocation:
+            need = self._kvpress_new_blocks(request_id, num_tokens, num_evicted)
+            return int(need.sum())
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
@@ -336,6 +360,19 @@ class KVCacheCoordinator(ABC):
             The new allocated blocks.
 
         """
+        if self.vectorized_allocation:
+            need = self._kvpress_new_blocks(request_id, num_tokens, num_evicted)
+            groups = np.flatnonzero(need).tolist()
+            if not groups:
+                return self.no_new_blocks
+            new_blocks: list[Sequence[KVCacheBlock]] = list(self.no_new_blocks)
+            for i in groups:
+                n = num_tokens - (num_evicted[i] if num_evicted else 0)
+                new_blocks[i] = self.single_type_managers[i].allocate_new_blocks(
+                    request_id, n, n
+                )
+            self.kvpress_num_blocks[request_id] += need
+            return tuple(new_blocks)  # type: ignore[arg-type]
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
@@ -346,6 +383,25 @@ class KVCacheCoordinator(ABC):
             )
             for i, manager in enumerate(self.single_type_managers)
         )
+
+    def _kvpress_new_blocks(
+        self, request_id: str, num_tokens: int, num_evicted: Sequence[int]
+    ) -> np.ndarray:
+        """Blocks each group still needs for `num_tokens` (full attention, no
+        prefix caching)."""
+        num_blocks = self.kvpress_num_blocks.get(request_id)
+        if num_blocks is None:
+            num_blocks = self.kvpress_num_blocks[request_id] = np.fromiter(
+                (
+                    len(m.req_to_blocks.get(request_id, ()))
+                    for m in self.single_type_managers
+                ),
+                dtype=np.int64,
+                count=len(self.single_type_managers),
+            )
+        num_slots = num_tokens - np.asarray(num_evicted or 0, dtype=np.int64)
+        block_sizes = np.asarray(self.group_block_sizes, dtype=np.int64)
+        return np.maximum(-(-num_slots // block_sizes) - num_blocks, 0)
 
     def get_num_cacheable_tokens(
         self, num_computed_tokens: int, kv_cache_group_id: int
@@ -408,6 +464,7 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
 
         """
+        self.kvpress_num_blocks.pop(request_id, None)
         for manager in self.single_type_managers:
             manager.free(request_id)
 
@@ -425,6 +482,7 @@ class KVCacheCoordinator(ABC):
             The request's blocks in allocation order.
 
         """
+        self.kvpress_num_blocks.pop(request_id, None)
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))
@@ -448,6 +506,8 @@ class KVCacheCoordinator(ABC):
                 manager types ignore it.
 
         """
+        if self.full_attention_only:
+            return  # full attention keeps every block until the request finishes
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(
                 request_id, processed_computed_tokens, num_prompt_tokens

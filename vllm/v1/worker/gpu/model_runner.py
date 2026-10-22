@@ -1747,17 +1747,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if start + q_len != end:
                 continue
             window = cfg.get("window_size", 64)
-            if q_len < window:
+            if cfg.get("press") != "precomputed" and q_len < window:
                 raise NotImplementedError(
                     f"kvpress: the last prefill chunk ({q_len} tokens) must cover the "
                     f"observation window ({window} tokens)"
                 )
+            keep_mask = None
+            if cfg.get("press") == "precomputed":
+                keep_mask = torch.load(cfg["keep_path"]).to(self.device, torch.bool)
+                layout = kvpress._layout
+                assert layout is not None
+                expected = (layout.num_layers, layout.num_kv_heads, end)
+                if tuple(keep_mask.shape) != expected:
+                    raise ValueError(
+                        f"kvpress keep mask {tuple(keep_mask.shape)} != {expected}"
+                    )
             plan.append(
                 kvpress.PressEntry(
                     batch_idx=i,
                     query_end=int(input_batch.query_start_loc_np[i + 1]),
                     seq_len=end,
                     cfg=cfg,
+                    keep_mask=keep_mask,
                 )
             )
         return plan
@@ -1955,6 +1966,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        kvpress.set_step(None)
         ubatch_state: UBatchState | None = None
         if batch_desc.num_ubatches > 1:
             assert self.ubatch_runner is not None
@@ -1982,8 +1994,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            attn_input_batch = (
+                self._kvpress_attn_batch(input_batch) if not dummy_run else input_batch
+            )
             attn_metadata = self.model_state.prepare_attn(
-                self._kvpress_attn_batch(input_batch) if not dummy_run else input_batch,
+                attn_input_batch,
                 batch_desc.cg_mode,
                 block_tables,
                 slot_mappings,
@@ -1994,6 +2009,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if kvpress.per_head_paging():
+                assert self.block_tables.input_block_table_stack is not None
+                kvpress.set_step(
+                    kvpress.make_step(
+                        self.block_tables.input_block_table_stack,
+                        slot_mappings,
+                        attn_input_batch.seq_lens,
+                        input_batch.query_start_loc,
+                        input_batch.num_reqs,
+                        input_batch.num_tokens,
+                    )
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

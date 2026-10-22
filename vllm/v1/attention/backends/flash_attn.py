@@ -19,6 +19,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
 )
 from vllm.v1 import kvpress
+from vllm.v1.kvpress import per_head as kvpress_per_head
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -1249,6 +1250,11 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if kvpress.per_head_paging():
+            return kvpress_per_head.forward(
+                self, layer, query, kv_cache, attn_metadata, output
+            )
+
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
@@ -1439,6 +1445,9 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+        if kvpress.per_head_paging():
+            kvpress_per_head.kv_cache_update(self, layer, key, value, kv_cache)
             return
 
         # Scatter write into the KV cache using slot_mapping indices.

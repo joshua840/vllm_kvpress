@@ -3,22 +3,29 @@
 """Post-prefill KV cache eviction (kvpress-style presses) for the V2 model runner.
 
 A request opts in with ``SamplingParams(extra_args={"kvpress": {...}})``:
-    press              "snapkv" (uniform) or "pyramidkv" (per layer)
+    press              "snapkv" (uniform), "pyramidkv" (per layer),
+                       "adakv" (per head, SnapKV scores) or
+                       "precomputed" (per head, keep mask from a file)
     compression_ratio  fraction of the compressed span to evict (kvpress semantics)
     compress_len       leading prompt tokens to compress (default: the whole prompt)
     window_size        SnapKV observation window (default 64)
     kernel_size        SnapKV pooling kernel (default 5)
     beta               PyramidKV pyramid steepness (default 20)
+    alpha_safeguard    AdaKV minimum kept fraction per head (default 0.2)
+    keep_path          precomputed: torch file with a bool keep mask
+                       (num_layers, num_kv_heads, compress_len)
 
 How much can differ is set once per engine by ``VLLM_KVPRESS_PAGING``:
     shared  one KV cache group for all layers (vLLM default): category A only
     layer   one KV cache group per layer: categories A and B
+    head    one KV cache group per (layer, KV head): categories A, B and C
 
 The worker evicts in the forward pass where the compressed span ends and reports
 the kept count of every KV cache group back to the scheduler, which frees the
 emptied tail blocks (``ModelRunnerOutput.kvpress_num_kept``).
 """
 
+import dataclasses
 import math
 import os
 from dataclasses import dataclass
@@ -30,8 +37,10 @@ import torch.nn.functional as F
 from vllm.v1.kvpress import triton_compact, triton_snapkv
 
 PRESS_PAGING = {
-    "snapkv": ("shared", "layer"),
-    "pyramidkv": ("layer",),
+    "snapkv": ("shared", "layer", "head"),
+    "pyramidkv": ("layer", "head"),
+    "adakv": ("head",),
+    "precomputed": ("head",),
 }
 
 
@@ -81,13 +90,27 @@ def layer_budget(cfg: dict, k_len: int, layer_idx: int, num_layers: int) -> int:
 
 
 def make_kv_cache_groups(kv_cache_spec: dict, mode: str) -> list:
-    """One KV cache group per layer, so each layer has its own block table."""
+    """One group per layer, or per (layer, KV head) with 1-head pages.
+
+    With per-head paging only the head-0 group of a layer lists the layer name, so
+    vLLM allocates one cache view and builds one attention metadata per layer; the
+    other groups only own block tables and slot mappings.
+    """
     from vllm.model_executor.models.utils import extract_layer_index
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
-    assert mode == "layer"
     names = sorted(kv_cache_spec, key=extract_layer_index)
-    return [KVCacheGroupSpec([n], kv_cache_spec[n]) for n in names]
+    if mode == "layer":
+        return [KVCacheGroupSpec([n], kv_cache_spec[n]) for n in names]
+    groups = []
+    for n in names:
+        spec = kv_cache_spec[n]
+        head_spec = dataclasses.replace(spec, num_kv_heads=1)
+        groups.append(KVCacheGroupSpec([n], head_spec))
+        groups += [
+            KVCacheGroupSpec([], head_spec) for _ in range(spec.num_kv_heads - 1)
+        ]
+    return groups
 
 
 @dataclass
@@ -110,19 +133,25 @@ def init_layout(kv_cache_config: Any, num_kv_heads: int) -> Layout:
     global _layout
     from vllm.model_executor.models.utils import extract_layer_index
 
+    mode = paging()
+    heads = num_kv_heads if mode == "head" else 1
     groups: dict[str, list[int]] = {}
     for g, group in enumerate(kv_cache_config.kv_cache_groups):
         for name in group.layer_names:
-            groups[name] = [g]
+            groups[name] = list(range(g, g + heads))
     names = sorted(groups, key=extract_layer_index)
     _layout = Layout(
-        paging=paging(),
+        paging=mode,
         num_kv_heads=num_kv_heads,
         num_groups=len(kv_cache_config.kv_cache_groups),
         layer_index={n: i for i, n in enumerate(names)},
         layer_groups=[groups[n] for n in names],
     )
     return _layout
+
+
+def per_head_paging() -> bool:
+    return _layout is not None and _layout.paging == "head"
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +166,59 @@ class PressEntry:
     query_end: int  # index after the last query token of this request in the flat batch
     seq_len: int  # KV length to compress (== compress_len)
     cfg: dict
+    keep_mask: torch.Tensor | None = None  # precomputed (layers, kv_heads, seq_len)
+
+
+@dataclass
+class StepContext:
+    """Per-group inputs of this step for per-head paging, built once per step so
+    each layer only slices them (see per_head.py)."""
+
+    block_tables: torch.Tensor  # (num_groups, num_reqs, max_blocks)
+    slot_mappings: torch.Tensor  # (num_groups, num_tokens)
+    seq_lens: torch.Tensor  # (num_groups, num_reqs) KV length per group
+    cu_seqlens_q: torch.Tensor  # (num_kv_heads * num_reqs + 1,) head-major queries
+    num_reqs: int
+    num_tokens: int
+
+
+def make_step(
+    block_tables: torch.Tensor,
+    slot_mappings: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: int,
+    num_tokens: int,
+) -> StepContext:
+    """block_tables: (num_groups, >= num_reqs, max_blocks); seq_lens: (num_groups,
+    >= num_reqs) or (>= num_reqs,) when no group has evicted anything."""
+    assert _layout is not None
+    if seq_lens.dim() == 1:
+        seq_lens = seq_lens.expand(_layout.num_groups, -1)
+    # Sequence (h, r) holds request r's queries for KV head h at h * T + qsl[r]
+    offsets = num_tokens * torch.arange(
+        _layout.num_kv_heads, device=query_start_loc.device, dtype=query_start_loc.dtype
+    )
+    cu_seqlens_q = torch.cat(
+        [
+            (query_start_loc[:num_reqs][None, :] + offsets[:, None]).flatten(),
+            offsets[-1:] + num_tokens,
+        ]
+    )
+    return StepContext(
+        block_tables=block_tables[:, :num_reqs].contiguous(),
+        slot_mappings=slot_mappings[:, :num_tokens].contiguous(),
+        seq_lens=seq_lens[:, :num_reqs].contiguous(),
+        cu_seqlens_q=cu_seqlens_q,
+        num_reqs=num_reqs,
+        num_tokens=num_tokens,
+    )
 
 
 # Set by the model runner around a forward pass, read by attention backends.
 _plan: list[PressEntry] = []
 _kept: torch.Tensor | None = None  # (len(_plan), num_groups) kept count per group
+_step: StepContext | None = None
 
 
 def set_plan(plan: list[PressEntry], device: torch.device | None = None) -> None:
@@ -163,6 +240,11 @@ def take_kept() -> list[list[int]]:
     """Kept KV count per (plan entry, group) after the forward pass."""
     assert _kept is not None
     return _kept.tolist()
+
+
+def set_step(step: StepContext | None) -> None:
+    global _step
+    _step = step
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +302,26 @@ def compact(
 # Eviction
 
 
+def adakv_mask(scores: torch.Tensor, n_kept: int, alpha: float) -> torch.Tensor:
+    """kvpress AdaKVPress: top-k across heads after a per-head safeguard."""
+    num_heads, k_len = scores.shape
+    n_safe = int(n_kept * alpha)
+    if alpha > 0:
+        n_safe = max(1, n_safe) if n_kept > 0 else 0
+    scores = scores.scatter(
+        -1, scores.topk(n_safe, dim=-1).indices, torch.finfo(scores.dtype).max
+    )
+    mask = torch.zeros(num_heads * k_len, dtype=torch.bool, device=scores.device)
+    mask[scores.view(-1).topk(num_heads * n_kept).indices] = True
+    return mask.view(num_heads, k_len)
+
+
+def mask_to_keep(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(H, n) bool -> kept indices first, ascending, per head; and kept counts."""
+    keep = torch.argsort((~mask).to(torch.int8), dim=-1, stable=True)
+    return keep, mask.sum(dim=-1, dtype=torch.int32)
+
+
 def apply(
     layer: torch.nn.Module,
     query: torch.Tensor,
@@ -229,19 +331,37 @@ def apply(
     """Score and compact the planned requests right after this layer's attention."""
     assert _layout is not None and _kept is not None
     layer_idx = _layout.layer_index[layer.layer_name]
-    (group,) = _layout.layer_groups[layer_idx]
+    groups = _layout.layer_groups[layer_idx]
+    num_kv_heads = _layout.num_kv_heads
+    if per_head_paging():
+        assert _step is not None
+        # 1-head pages: every head reads the same cache view with its own blocks
+        kv_cache = kv_cache.expand(-1, num_kv_heads, -1, -1)
     for row, e in enumerate(_plan):
-        block_ids = attn_metadata.block_table[e.batch_idx]
-        window = e.cfg.get("window_size", 64)
-        scores = triton_snapkv.snapkv_scores(
-            query[e.query_end - window : e.query_end],
-            kv_cache,
-            block_ids,
-            e.seq_len,
-            e.cfg.get("kernel_size", 5),
-        )
-        budget = layer_budget(e.cfg, e.seq_len, layer_idx, _layout.num_layers)
-        keep = scores.topk(budget, dim=-1).indices.sort(dim=-1).values
-        triton_compact.compact(kv_cache, block_ids, keep)
-        # With shared paging every layer writes the same group and budget
-        _kept[row, group] = budget
+        if per_head_paging():
+            block_ids = _step.block_tables[groups[0] : groups[-1] + 1, e.batch_idx]
+        else:
+            block_ids = attn_metadata.block_table[e.batch_idx]
+        press = e.cfg.get("press", "snapkv")
+        if press == "precomputed":
+            assert e.keep_mask is not None
+            keep, n_kept = mask_to_keep(e.keep_mask[layer_idx])
+        else:
+            window = e.cfg.get("window_size", 64)
+            scores = triton_snapkv.snapkv_scores(
+                query[e.query_end - window : e.query_end],
+                kv_cache,
+                block_ids,
+                e.seq_len,
+                e.cfg.get("kernel_size", 5),
+            )
+            budget = layer_budget(e.cfg, e.seq_len, layer_idx, _layout.num_layers)
+            if press == "adakv":
+                mask = adakv_mask(scores, budget, e.cfg.get("alpha_safeguard", 0.2))
+                keep, n_kept = mask_to_keep(mask)
+            else:
+                keep = scores.topk(budget, dim=-1).indices.sort(dim=-1).values
+                n_kept = torch.full_like(keep[:, 0], budget, dtype=torch.int32)
+        triton_compact.compact(kv_cache, block_ids, keep, n_kept)
+        # Without per-head paging all heads of a layer share one group (and count)
+        _kept[row, groups] = n_kept if len(groups) > 1 else n_kept[:1]

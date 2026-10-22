@@ -102,9 +102,9 @@ class KVCacheBlocks:
             if group_ids is None
             else tuple(self.blocks[group_id] for group_id in group_ids)
         )
-        if allow_none and all(len(group) == 0 for group in groups):
+        if allow_none and not any(groups):
             return None
-        return tuple([blk.block_id for blk in group] for group in groups)
+        return tuple([[blk.block_id for blk in group] for group in groups])
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
@@ -373,6 +373,7 @@ class KVCacheManager:
         (kvpress eviction)."""
         for manager, n in zip(self.coordinator.single_type_managers, num_tokens):
             manager.truncate(request.request_id, n)
+        self.coordinator.kvpress_num_blocks.pop(request.request_id, None)
 
     def allocate_slots(
         self,

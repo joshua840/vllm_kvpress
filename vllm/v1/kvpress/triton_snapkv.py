@@ -48,7 +48,8 @@ def _softmax_stats_kernel(
     stride_b,
     stride_h,
     stride_n,
-    block_ids_ptr,
+    block_ids_ptr,  # (num_kv_heads, num_request_blocks)
+    stride_bid,
     m_ptr,  # (num_heads, num_splits, WINDOW) fp32, partial max
     l_ptr,  # (num_heads, num_splits, WINDOW) fp32, partial sum of exp
     seq_len,
@@ -74,7 +75,7 @@ def _softmax_stats_kernel(
         n = start + tl.arange(0, BLOCK_N)
         k = _load_keys(
             kv_ptr,
-            block_ids_ptr,
+            block_ids_ptr + (h // GROUPS) * stride_bid,
             n,
             h // GROUPS,
             stride_b,
@@ -110,6 +111,7 @@ def _window_mean_kernel(
     stride_h,
     stride_n,
     block_ids_ptr,
+    stride_bid,
     m_ptr,
     l_ptr,
     out_ptr,  # (num_heads, seq_len - WINDOW) fp32
@@ -131,7 +133,7 @@ def _window_mean_kernel(
     q = tl.load(q_ptr + w[:, None] * stride_qw + h * stride_qh + d[None, :])
     k = _load_keys(
         kv_ptr,
-        block_ids_ptr,
+        block_ids_ptr + (h // GROUPS) * stride_bid,
         n,
         h // GROUPS,
         stride_b,
@@ -158,12 +160,16 @@ def snapkv_scores(
     """SnapKV scores for one request, same output as kvpress SnapKVPress.score.
 
     queries: (window_size, num_heads, head_size), post-RoPE.
-    kv_cache: (num_blocks, num_kv_heads, block_size, 2 * head_size).
+    kv_cache: (num_blocks, num_kv_heads, block_size, 2 * head_size); head stride 0
+        for a per-head paged cache.
+    block_ids: (num_request_blocks,) shared by all heads, or (num_kv_heads, ...).
     Returns (num_kv_heads, seq_len); the window gets max + 1 so it is always kept.
     """
     window, num_heads, head_dim = queries.shape
     num_kv_heads, block_size = kv_cache.shape[1], kv_cache.shape[2]
     groups = num_heads // num_kv_heads
+    if block_ids.dim() == 1:
+        block_ids = block_ids.expand(num_kv_heads, -1)
     n_scored = seq_len - window
     split_n = 512
     num_splits = triton.cdiv(seq_len, split_n)
@@ -178,6 +184,7 @@ def snapkv_scores(
         kv_cache.stride(1),
         kv_cache.stride(2),
         block_ids,
+        block_ids.stride(0),
     )
     meta = dict(GROUPS=groups, BLOCK_SIZE=block_size, WINDOW=window, HEAD_DIM=head_dim)
     scale = head_dim**-0.5
