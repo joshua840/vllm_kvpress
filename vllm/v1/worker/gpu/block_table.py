@@ -81,8 +81,12 @@ class BlockTables:
             dtype=torch.int64,
             device=self.device,
         )
-        # Default per-request evicted KV count (kvpress) when the caller passes none.
-        self.no_evicted = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        # KV pairs evicted by kvpress per (group, request). KV length of a group =
+        # num_computed_tokens - num_evicted, while RoPE positions keep counting
+        # from num_computed_tokens.
+        self.num_evicted = UvaBackedTensor(
+            (self.num_kv_cache_groups, self.max_num_reqs), dtype=torch.int32
+        )
 
         self.init_block_table_layout_tensors()
 
@@ -193,9 +197,7 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
-        num_evicted: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """num_evicted: evicted KV count per request (kvpress); slot = pos - evicted."""
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
         num_reqs = idx_mapping.shape[0]
@@ -206,7 +208,8 @@ class BlockTables:
             idx_mapping,
             query_start_loc,
             positions,
-            num_evicted if num_evicted is not None else self.no_evicted,
+            self.num_evicted.gpu,
+            self.num_evicted.gpu.stride(0),
             self.block_table_ptrs,
             self.block_table_strides,
             self.block_sizes_tensor,
@@ -280,7 +283,8 @@ def _compute_slot_mappings_kernel(
     idx_mapping,  # [num_reqs]
     query_start_loc,  # [num_reqs + 1]
     pos,  # [num_tokens]
-    num_evicted_ptr,  # [max_num_reqs]
+    num_evicted_ptr,  # [num_kv_cache_groups, max_num_reqs]
+    num_evicted_stride,
     block_table_ptrs,  # [num_kv_cache_groups]
     block_table_strides,  # [num_kv_cache_groups]
     block_sizes,  # [num_kv_cache_groups]
@@ -326,8 +330,12 @@ def _compute_slot_mappings_kernel(
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
-        # KV slots skip evicted pairs: slot index = position - num_evicted.
-        positions -= tl.load(num_evicted_ptr + req_state_idx, mask=is_real_req, other=0)
+        # KV slots skip evicted pairs (kvpress): slot index = position - num_evicted.
+        positions -= tl.load(
+            num_evicted_ptr + group_id * num_evicted_stride + req_state_idx,
+            mask=is_real_req,
+            other=0,
+        )
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.

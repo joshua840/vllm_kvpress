@@ -183,10 +183,11 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
-        # kvpress: KV pairs evicted after the compressed span was prefilled.
-        # KV length = num_computed_tokens - num_evicted_tokens.
+        # kvpress: KV pairs evicted per KV cache group after the compressed span
+        # was prefilled; () before. KV length of group g =
+        # num_computed_tokens - num_evicted_tokens[g].
         self.kvpress = kvpress.get_config(sampling_params)
-        self.num_evicted_tokens = 0
+        self.num_evicted_tokens: tuple[int, ...] = ()
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

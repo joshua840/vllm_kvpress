@@ -198,6 +198,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
+        num_evicted: Sequence[int] = (),
     ) -> int:
         """Get the number of device blocks needed to be allocated for the request.
 
@@ -224,6 +225,7 @@ class KVCacheCoordinator(ABC):
                 retention Mamba reserves a prefill checkpoint only on the chunk
                 reaching it; under dense retention every chunk publishes a
                 state, so it is ignored (0).
+            num_evicted: KV pairs evicted per group (kvpress); they need no slots.
 
         Returns:
             The number of blocks to allocate.
@@ -246,13 +248,14 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
+                evicted = num_evicted[i] if num_evicted else 0
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
                     request_id,
-                    num_tokens,
+                    num_tokens - evicted,
                     new_computed_blocks[i],
                     total_computed_tokens,
                     num_local_computed_tokens,
-                    num_tokens_main_model,
+                    num_tokens_main_model - evicted,
                     apply_admission_cap=apply_admission_cap,
                     prefill_end=prefill_end,
                 )
@@ -314,9 +317,10 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        num_evicted: Sequence[int] = (),
     ) -> tuple[list[KVCacheBlock], ...]:
         """Allocate new blocks for the request to give it at least `num_tokens`
-        token slots.
+        token slots (minus the KV pairs evicted from each group by kvpress).
 
         Args:
             request_id: The request ID.
@@ -337,10 +341,10 @@ class KVCacheCoordinator(ABC):
                 request_id,
                 num_encoder_tokens
                 if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
+                else num_tokens - (num_evicted[i] if num_evicted else 0),
+                num_tokens_main_model - (num_evicted[i] if num_evicted else 0),
             )
-            for manager in self.single_type_managers
+            for i, manager in enumerate(self.single_type_managers)
         )
 
     def get_num_cacheable_tokens(

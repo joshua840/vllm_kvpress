@@ -480,7 +480,9 @@ def build_attn_metadata(
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    seq_lens = seq_lens[:num_reqs]
+    # seq_lens may be [num_kv_cache_groups, num_reqs] when KV lengths differ per
+    # group (kvpress per-layer / per-head eviction).
+    seq_lens = seq_lens[..., :num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
     if dcp_local_seq_lens_cpu_upper_bound is not None:
@@ -526,7 +528,7 @@ def build_attn_metadata(
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens[i] if seq_lens.dim() == 2 else seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             max_seq_len=max_seq_len,
             num_reqs=num_reqs,

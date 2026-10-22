@@ -1600,7 +1600,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        request.num_evicted_tokens = 0
+        request.num_evicted_tokens = ()
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2056,26 +2056,26 @@ class Scheduler(SchedulerInterface):
         # The chunk would end inside the window
         return max(window_start - num_computed_tokens, 0)
 
-    def _apply_kvpress_evictions(self, scheduler_output: SchedulerOutput) -> None:
-        """Free the blocks the worker emptied by compacting KV in this step."""
-        for req_id in scheduler_output.num_scheduled_tokens:
+    def _apply_kvpress_evictions(self, model_runner_output: ModelRunnerOutput) -> None:
+        """Free the blocks the worker emptied by compacting KV in this step.
+
+        The worker reports the kept KV count of every KV cache group, since
+        data-dependent presses (AdaKV) only know it after scoring.
+        """
+        for req_id, num_kept in (model_runner_output.kvpress_num_kept or {}).items():
             request = self.requests.get(req_id)
-            if request is None or request.kvpress is None or request.num_evicted_tokens:
+            if request is None:
                 continue
             end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
-            if request.num_computed_tokens < end:
-                continue
-            request.num_evicted_tokens = kvpress.num_evicted(
-                request.kvpress, request.num_prompt_tokens
-            )
-            self.kv_cache_manager.truncate(request, end - request.num_evicted_tokens)
+            request.num_evicted_tokens = tuple(end - n for n in num_kept)
+            self.kv_cache_manager.truncate(request, num_kept)
 
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self._apply_kvpress_evictions(scheduler_output)
+        self._apply_kvpress_evictions(model_runner_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

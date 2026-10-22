@@ -310,6 +310,10 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # kvpress: req_id -> kept KV count per KV cache group, for requests whose
+    # compressed span was evicted in this step.
+    kvpress_num_kept: dict[str, list[int]] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

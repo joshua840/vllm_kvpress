@@ -20,6 +20,7 @@ from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1 import kvpress
 from vllm.v1.hisparse.layout import (
     get_hisparse_host_pool_bytes,
     get_hisparse_kv_cache_config,
@@ -2182,6 +2183,9 @@ def get_kv_cache_groups(
         return hisparse_groups
 
     if is_kv_cache_spec_uniform(kv_cache_spec):
+        if (mode := kvpress.paging()) != "shared":
+            # kvpress: per-layer or per-(layer, head) block tables
+            return kvpress.make_kv_cache_groups(kv_cache_spec, mode)
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
