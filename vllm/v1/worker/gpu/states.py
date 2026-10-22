@@ -63,6 +63,12 @@ class RequestState:
         )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+        # KV pairs evicted by a kvpress press.
+        # KV length = num_computed_tokens - num_evicted,
+        # while RoPE positions keep counting from num_computed_tokens.
+        self.num_evicted = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+        # req_idx -> kvpress config, for requests that opted in.
+        self.kvpress: dict[int, dict] = {}
 
         # Last sampled tokens.
         self.last_sampled_tokens = torch.zeros(
@@ -113,12 +119,15 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+        self.num_evicted.np[req_idx] = 0
+        self.kvpress.pop(req_idx, None)
 
         self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()
+        self.num_evicted.copy_to_uva()
         self.total_len.apply_write()
         self.all_token_ids.apply_write()
         self.num_computed_tokens.apply_write()

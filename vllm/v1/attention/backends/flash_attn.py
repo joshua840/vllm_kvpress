@@ -18,6 +18,7 @@ from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
 )
+from vllm.v1 import kvpress
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -1422,6 +1423,9 @@ class FlashAttentionImpl(AttentionImpl):
                 mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                 aux_tensors=rswa_aux or mm_aux,
             )
+            if kvpress.get_plan():
+                # Evict KV pairs of requests whose compressed span ended in this step.
+                kvpress.apply(layer, query, kv_cache, attn_metadata)
             return output
 
     def do_kv_cache_update(

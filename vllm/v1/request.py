@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1 import kvpress
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -182,6 +183,10 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # kvpress: KV pairs evicted after the compressed span was prefilled.
+        # KV length = num_computed_tokens - num_evicted_tokens.
+        self.kvpress = kvpress.get_config(sampling_params)
+        self.num_evicted_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

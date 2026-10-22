@@ -31,6 +31,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.utils.math_utils import cdiv
+from vllm.v1 import kvpress
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -707,6 +708,9 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            num_new_tokens = self._cap_at_kvpress_boundary(
+                request, request.num_computed_tokens, num_new_tokens
+            )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -1154,6 +1158,9 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    num_new_tokens = self._cap_at_kvpress_boundary(
+                        request, num_computed_tokens, num_new_tokens
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1591,6 +1598,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.num_evicted_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2023,11 +2031,38 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids, bitmask, num_acceptable_drafts
         )
 
+    @staticmethod
+    def _cap_at_kvpress_boundary(
+        request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """End a prefill chunk exactly where the kvpress-compressed span ends."""
+        if request.kvpress is None or request.num_evicted_tokens:
+            return num_new_tokens
+        end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
+        if num_computed_tokens < end < num_computed_tokens + num_new_tokens:
+            return end - num_computed_tokens
+        return num_new_tokens
+
+    def _apply_kvpress_evictions(self, scheduler_output: SchedulerOutput) -> None:
+        """Free the blocks the worker emptied by compacting KV in this step."""
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is None or request.kvpress is None or request.num_evicted_tokens:
+                continue
+            end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
+            if request.num_computed_tokens < end:
+                continue
+            request.num_evicted_tokens = kvpress.num_evicted(
+                request.kvpress, request.num_prompt_tokens
+            )
+            self.kv_cache_manager.truncate(request, end - request.num_evicted_tokens)
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self._apply_kvpress_evictions(scheduler_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

@@ -578,6 +578,15 @@ class SingleTypeKVCacheManager(ABC):
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
 
+    def truncate(self, request_id: str, num_tokens: int) -> None:
+        """Free the tail blocks beyond `num_tokens` slots (kvpress eviction)."""
+        req_blocks = self.req_to_blocks[request_id]
+        num_kept_blocks = cdiv(num_tokens, self.block_size)
+        if len(req_blocks) > num_kept_blocks:
+            removed = req_blocks[num_kept_blocks:]
+            del req_blocks[num_kept_blocks:]
+            self.block_pool.free_blocks(reversed(removed))
+
     def free(self, request_id: str) -> None:
         """Free the blocks for the request.
 

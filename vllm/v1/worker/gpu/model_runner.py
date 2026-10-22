@@ -16,6 +16,7 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
+import dataclasses
 import functools
 import gc
 import time
@@ -63,8 +64,10 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
+from vllm.v1 import kvpress
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -1198,6 +1201,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            if (kvpress_cfg := kvpress.get_config(sampling_params)) is not None:
+                self.req_states.kvpress[req_index] = kvpress_cfg
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1570,6 +1575,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
+            num_evicted=self.req_states.num_evicted.gpu,
         )
         return block_tables, slot_mappings
 
@@ -1716,6 +1722,59 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _build_kvpress_plan(self, input_batch: InputBatch) -> list[kvpress.PressEntry]:
+        """Requests whose compressed span ends in this step (pruned during forward)."""
+        plan = []
+        if not self.req_states.kvpress:
+            return plan
+        for i in range(input_batch.num_reqs):
+            req_idx = int(input_batch.idx_mapping_np[i])
+            cfg = self.req_states.kvpress.get(req_idx)
+            if cfg is None or self.req_states.num_evicted.np[req_idx] > 0:
+                continue
+            prompt_len = int(self.req_states.prompt_len.np[req_idx])
+            end = kvpress.compress_len(cfg, prompt_len)
+            start = int(input_batch.num_computed_tokens_np[i])
+            q_len = int(input_batch.num_scheduled_tokens[i])
+            if start + q_len != end:
+                continue
+            window = cfg.get("window_size", 64)
+            if q_len < window:
+                raise NotImplementedError(
+                    f"kvpress: the last prefill chunk ({q_len} tokens) must cover the "
+                    f"observation window ({window} tokens)"
+                )
+            plan.append(
+                kvpress.PressEntry(
+                    batch_idx=i,
+                    query_end=int(input_batch.query_start_loc_np[i + 1]),
+                    seq_len=end,
+                    n_kept=kvpress.num_kept(cfg, prompt_len),
+                    window_size=window,
+                    kernel_size=cfg.get("kernel_size", 5),
+                )
+            )
+        return plan
+
+    def _kvpress_attn_batch(self, input_batch: InputBatch) -> InputBatch:
+        """Attention sees KV lengths without evicted pairs; sampling keeps seq_lens."""
+        if not self.req_states.kvpress:
+            return input_batch
+        kv_seq_lens = input_batch.seq_lens.clone()
+        n = input_batch.num_reqs
+        kv_seq_lens[:n] -= self.req_states.num_evicted.gpu[input_batch.idx_mapping[:n]]
+        return dataclasses.replace(input_batch, seq_lens=kv_seq_lens)
+
+    def _finish_kvpress_plan(self, input_batch: InputBatch) -> None:
+        """Record the eviction and drop the tail blocks the scheduler frees."""
+        for e in kvpress.get_plan():
+            req_idx = int(input_batch.idx_mapping_np[e.batch_idx])
+            self.req_states.num_evicted.np[req_idx] = e.seq_len - e.n_kept
+            for g, block_size in enumerate(self.block_tables.block_sizes):
+                self.block_tables.num_blocks.np[g, req_idx] = cdiv(e.n_kept, block_size)
+        self.req_states.num_evicted.copy_to_uva()
+        kvpress.set_plan([])
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1813,6 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            kvpress.set_plan(self._build_kvpress_plan(input_batch))
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1913,7 +1973,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for groups in attn_groups
                 ]
             attn_metadata = self.model_state.prepare_attn(
-                input_batch,
+                self._kvpress_attn_batch(input_batch) if not dummy_run else input_batch,
                 batch_desc.cg_mode,
                 block_tables,
                 slot_mappings,
@@ -2044,6 +2104,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if kvpress.get_plan():
+            self._finish_kvpress_plan(input_batch)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

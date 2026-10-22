@@ -368,6 +368,11 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def truncate(self, request: Request, num_tokens: int) -> None:
+        """Keep the blocks of the first `num_tokens` KV slots (kvpress eviction)."""
+        for manager in self.coordinator.single_type_managers:
+            manager.truncate(request.request_id, num_tokens)
+
     def allocate_slots(
         self,
         request: Request,
@@ -521,7 +526,9 @@ class KVCacheManager:
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
-            full_num_tokens = min(request.num_tokens, self.max_model_len)
+            full_num_tokens = (
+                min(request.num_tokens, self.max_model_len) - request.num_evicted_tokens
+            )
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
@@ -538,7 +545,10 @@ class KVCacheManager:
             if required_blocks > self.block_pool.get_num_free_blocks():
                 return None
 
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        # Evicted KV pairs (kvpress) need no slots.
+        num_tokens_main_model = (
+            total_computed_tokens + num_new_tokens - request.num_evicted_tokens
+        )
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
