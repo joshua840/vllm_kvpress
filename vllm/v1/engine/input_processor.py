@@ -33,6 +33,7 @@ from vllm.utils.async_utils import make_async
 from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1 import kvpress
 from vllm.v1.kv_hints import KvHintsEnvelope
 
 logger = init_logger(__name__)
@@ -175,6 +176,7 @@ class InputProcessor:
                     )
 
             self.validate_logits_processors_params(params)
+            kvpress.validate(params, self.vllm_config)
 
             if self.model_config.is_diffusion:
                 # Without --diffusion-config the served canvas is unknown here;

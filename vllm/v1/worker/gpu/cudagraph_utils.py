@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1 import kvpress
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -804,6 +805,10 @@ def prepare_inputs_to_capture(
     )
     if pcp_manager is not None:
         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
+    # Capture with the KV length buffer that kvpress requests replay with
+    input_batch = replace(
+        input_batch, seq_lens=kvpress.attn_seq_lens(input_batch.seq_lens)
+    )
 
     block_table_provider = pcp_manager or block_tables
     input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)

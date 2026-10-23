@@ -62,6 +62,30 @@ def get_config(sampling_params: Any) -> dict | None:
     return cfg
 
 
+def validate(sampling_params: Any, vllm_config: Any) -> None:
+    """Reject a kvpress request on engine settings that silently break eviction
+    (results/compat: their RULER scores collapse)."""
+    if (cfg := get_config(sampling_params)) is None:
+        return
+    cache, backend = vllm_config.cache_config, vllm_config.attention_config.backend
+    unsupported = {
+        f"press={cfg.get('press')} with tensor parallelism (each rank selects its "
+        "own heads, but the scheduler frees blocks by rank 0's kept counts)":
+            cfg.get("press") in ("adakv", "precomputed")
+            and vllm_config.parallel_config.tensor_parallel_size > 1,
+        "prefix caching (hashes of compressed blocks no longer match their tokens)":
+            cache.enable_prefix_caching,
+        "async scheduling (the next step is scheduled before the kept counts arrive)":
+            vllm_config.scheduler_config.async_scheduling,
+        f"kv_cache_dtype={cache.cache_dtype} (kernels read bf16/fp16 caches)":
+            cache.cache_dtype != "auto",
+        f"attention backend {backend.name if backend else ''} (hooks are in "
+        "FlashAttention only)": backend is not None and backend.name != "FLASH_ATTN",
+    }
+    if bad := [name for name, on in unsupported.items() if on]:
+        raise ValueError("kvpress does not support " + ", ".join(bad))
+
+
 def compress_len(cfg: dict, prompt_len: int) -> int:
     return min(cfg.get("compress_len", prompt_len), prompt_len)
 
@@ -152,6 +176,28 @@ def init_layout(kv_cache_config: Any, num_kv_heads: int) -> Layout:
 
 def per_head_paging() -> bool:
     return _layout is not None and _layout.paging == "head"
+
+
+_attn_seq_lens: torch.Tensor | None = None
+
+
+def init_attn_seq_lens(max_num_reqs: int, device: torch.device) -> None:
+    global _attn_seq_lens
+    assert _layout is not None
+    shape = (_layout.num_groups, max_num_reqs)
+    if _attn_seq_lens is None or _attn_seq_lens.shape != shape:
+        _attn_seq_lens = torch.zeros(shape, dtype=torch.int32, device=device)
+
+
+def attn_seq_lens(seq_lens: torch.Tensor) -> torch.Tensor:
+    """Copy of seq_lens with one row per KV cache group, for attention to subtract
+    evicted pairs from. Always the same buffer: FULL CUDA graphs replay the
+    addresses seen at capture, whose inputs are built outside the model runner
+    (cudagraph_utils.prepare_inputs_to_capture)."""
+    assert _attn_seq_lens is not None
+    out = _attn_seq_lens[:, : seq_lens.shape[0]]
+    out.copy_(seq_lens.expand_as(out))
+    return out
 
 
 # ---------------------------------------------------------------------------

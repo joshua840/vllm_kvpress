@@ -709,6 +709,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config,
             self.model_config.get_num_kv_heads(self.parallel_config),
         )
+        kvpress.init_attn_seq_lens(self.max_num_reqs, self.device)
         # req_id -> kept KV count per group, reported to the scheduler.
         self.kvpress_num_kept: dict[str, list[int]] = {}
         self.pcp_manager = pcp.maybe_build_pcp_manager(
@@ -751,6 +752,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
+        if kvpress.per_head_paging() and (
+            cudagraph_mode != CUDAGraphMode.NONE
+            or self.cache_config.cache_dtype != "auto"
+            or any(
+                g.backend.get_name() != "FLASH_ATTN"
+                for groups in self.attn_groups
+                for g in groups
+            )
+        ):
+            raise ValueError(
+                "VLLM_KVPRESS_PAGING=head needs enforce_eager=True, "
+                "kv_cache_dtype='auto' and the FLASH_ATTN backend"
+            )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -1773,15 +1787,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return plan
 
-    def _kvpress_attn_batch(self, input_batch: InputBatch) -> InputBatch:
+    def _kvpress_attn_batch(
+        self, input_batch: InputBatch, dummy_run: bool
+    ) -> InputBatch:
         """Attention sees KV lengths without evicted pairs, one row per KV cache
         group; sampling keeps the logical seq_lens."""
-        if not self.req_states.kvpress:
-            return input_batch
-        num_evicted = self.block_tables.num_evicted.gpu
-        kv_seq_lens = input_batch.seq_lens.repeat(num_evicted.shape[0], 1)
-        n = input_batch.num_reqs
-        kv_seq_lens[:, :n] -= num_evicted[:, input_batch.idx_mapping[:n]]
+        kv_seq_lens = kvpress.attn_seq_lens(input_batch.seq_lens)
+        if self.req_states.kvpress and not dummy_run:
+            n = input_batch.num_reqs
+            num_evicted = self.block_tables.num_evicted.gpu
+            kv_seq_lens[:, :n] -= num_evicted[:, input_batch.idx_mapping[:n]]
         return dataclasses.replace(input_batch, seq_lens=kv_seq_lens)
 
     def _finish_kvpress_plan(self, input_batch: InputBatch) -> None:
@@ -1994,9 +2009,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_input_batch = (
-                self._kvpress_attn_batch(input_batch) if not dummy_run else input_batch
-            )
+            attn_input_batch = self._kvpress_attn_batch(input_batch, dummy_run)
             attn_metadata = self.model_state.prepare_attn(
                 attn_input_batch,
                 batch_desc.cg_mode,
