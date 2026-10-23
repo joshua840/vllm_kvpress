@@ -364,9 +364,11 @@ def _compute_slot_mappings_kernel(
 
         block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
         block_offsets = local_positions % kv_block_size
+        # Lanes past end_idx read position 0, which goes negative after
+        # subtracting num_evicted: keep them off the block table.
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local & is_real_req,
+            mask=is_local & is_real_req & (offset < end_idx),
             other=0,
         )
         slot_ids = block_numbers * kv_block_size + block_offsets
