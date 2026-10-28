@@ -217,15 +217,44 @@ class PressEntry:
 
 @dataclass
 class StepContext:
-    """Per-group inputs of this step for per-head paging, built once per step so
-    each layer only slices them (see per_head.py)."""
+    """Per-layer inputs of this step for per-head paging, built once per step so
+    each layer only indexes them (see per_head.py). A layer's attention runs over
+    num_kv_heads * num_reqs sequences, sequence h * num_reqs + r holding request
+    r's queries for KV head h. New K/V slots are token-major (token t, head h at
+    t * num_kv_heads + h), the order of the K/V tensors, so writing them needs no
+    reordering. Views of persistent buffers: FULL CUDA graphs replay the
+    addresses seen at capture."""
 
-    block_tables: torch.Tensor  # (num_groups, num_reqs, max_blocks)
-    slot_mappings: torch.Tensor  # (num_groups, num_tokens)
-    seq_lens: torch.Tensor  # (num_groups, num_reqs) KV length per group
-    cu_seqlens_q: torch.Tensor  # (num_kv_heads * num_reqs + 1,) head-major queries
+    block_tables: torch.Tensor  # (num_layers, num_seqs, max_blocks)
+    seq_lens: torch.Tensor  # (num_layers, num_seqs) KV length per sequence
+    slot_mappings: torch.Tensor  # (num_layers, num_tokens * num_kv_heads)
+    cu_seqlens_q: torch.Tensor  # (num_seqs + 1,)
     num_reqs: int
     num_tokens: int
+
+    def request_block_tables(self, layer_idx: int, req_idx: int) -> torch.Tensor:
+        """(num_kv_heads, max_blocks) block tables of one request in one layer."""
+        table = self.block_tables[layer_idx]
+        return table.view(-1, self.num_reqs, table.shape[-1])[:, req_idx]
+
+
+# Persistent buffers behind StepContext (per-head paging only).
+_step_buffers: dict[str, torch.Tensor] = {}
+
+
+def init_step_buffers(
+    max_num_reqs: int, max_num_tokens: int, max_blocks: int, device: torch.device
+) -> None:
+    assert _layout is not None
+    groups, heads, rows = _layout.num_groups, _layout.num_kv_heads, max_num_reqs
+    i32, i64 = torch.int32, torch.int64
+    _step_buffers.update(
+        block_tables=torch.zeros(groups * rows * max_blocks, dtype=i32, device=device),
+        seq_lens=torch.zeros(groups * rows, dtype=i32, device=device),
+        slot_mappings=torch.zeros(groups * max_num_tokens, dtype=i64, device=device),
+        cu_seqlens_q=torch.zeros(heads * rows + 1, dtype=i32, device=device),
+        head_offsets=torch.arange(heads, dtype=i32, device=device)[:, None],
+    )
 
 
 def make_step(
@@ -237,24 +266,42 @@ def make_step(
     num_tokens: int,
 ) -> StepContext:
     """block_tables: (num_groups, >= num_reqs, max_blocks); seq_lens: (num_groups,
-    >= num_reqs) or (>= num_reqs,) when no group has evicted anything."""
+    >= num_reqs) or (>= num_reqs,) when no group has evicted anything;
+    query_start_loc: (>= num_reqs + 1,).
+
+    Under a FULL CUDA graph num_reqs and num_tokens are the padded sizes: padded
+    requests have no queries except the last, which takes the padded tokens, and
+    no KV (seq_len 0)."""
     assert _layout is not None
-    if seq_lens.dim() == 1:
-        seq_lens = seq_lens.expand(_layout.num_groups, -1)
+    layers, heads, rows = _layout.num_layers, _layout.num_kv_heads, num_reqs
+    max_blocks = block_tables.shape[-1]
+    seqs = heads * rows
+    buf = _step_buffers
+    step_block_tables = buf["block_tables"][: layers * seqs * max_blocks]
+    step_block_tables.view(layers * heads, rows, max_blocks).copy_(
+        block_tables[:, :rows]
+    )
+    step_seq_lens = buf["seq_lens"][: layers * seqs]
+    step_seq_lens.view(layers * heads, rows).copy_(
+        seq_lens[..., :rows].expand(layers * heads, -1)
+    )
+    # Token-major slots: (layer, head, token) -> (layer, token, head)
+    step_slots = buf["slot_mappings"][: layers * num_tokens * heads]
+    step_slots.view(layers, num_tokens, heads).copy_(
+        slot_mappings[:, :num_tokens].view(layers, heads, num_tokens).transpose(1, 2)
+    )
     # Sequence (h, r) holds request r's queries for KV head h at h * T + qsl[r]
-    offsets = num_tokens * torch.arange(
-        _layout.num_kv_heads, device=query_start_loc.device, dtype=query_start_loc.dtype
+    cu_seqlens_q = buf["cu_seqlens_q"][: seqs + 1]
+    torch.add(
+        query_start_loc[:rows][None, :],
+        buf["head_offsets"] * num_tokens,
+        out=cu_seqlens_q[:-1].view(heads, rows),
     )
-    cu_seqlens_q = torch.cat(
-        [
-            (query_start_loc[:num_reqs][None, :] + offsets[:, None]).flatten(),
-            offsets[-1:] + num_tokens,
-        ]
-    )
+    cu_seqlens_q[-1:].fill_(heads * num_tokens)
     return StepContext(
-        block_tables=block_tables[:, :num_reqs].contiguous(),
-        slot_mappings=slot_mappings[:, :num_tokens].contiguous(),
-        seq_lens=seq_lens[:, :num_reqs].contiguous(),
+        block_tables=step_block_tables.view(layers, seqs, max_blocks),
+        seq_lens=step_seq_lens.view(layers, seqs),
+        slot_mappings=step_slots.view(layers, num_tokens * heads),
         cu_seqlens_q=cu_seqlens_q,
         num_reqs=num_reqs,
         num_tokens=num_tokens,
@@ -385,7 +432,7 @@ def apply(
         kv_cache = kv_cache.expand(-1, num_kv_heads, -1, -1)
     for row, e in enumerate(_plan):
         if per_head_paging():
-            block_ids = _step.block_tables[groups[0] : groups[-1] + 1, e.batch_idx]
+            block_ids = _step.request_block_tables(layer_idx, e.batch_idx)
         else:
             block_ids = attn_metadata.block_table[e.batch_idx]
         press = e.cfg.get("press", "snapkv")

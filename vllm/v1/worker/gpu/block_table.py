@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -77,6 +79,9 @@ class BlockTables:
         # kvpress per-head paging reads all groups at once: keep same-shaped input
         # block tables as views of one [num_kv_cache_groups, ...] tensor.
         self.input_block_table_stack: torch.Tensor | None = None
+        # num_reqs_padded -> views of input_block_tables (the tensors are persistent)
+        self.input_block_table_views: dict[int, tuple[torch.Tensor, ...]] = {}
+        self.max_num_blocks_np = np.array(max_num_blocks_per_group, dtype=np.int64)
         if len({tuple(b.gpu.shape) for b in self.block_tables}) == 1:
             self.input_block_table_stack = torch.stack(self.input_block_tables)
             self.input_block_tables = list(self.input_block_table_stack.unbind(0))
@@ -125,6 +130,13 @@ class BlockTables:
         new_block_ids: tuple[list[int], ...],
         overwrite: bool,
     ) -> None:
+        if (
+            not overwrite
+            and self.fused_writer is not None
+            and not self.redirect_writes_to_null_block
+        ):
+            self.append_new_block_ids([req_index], [new_block_ids])
+            return
         for i in range(self.num_kv_cache_groups):
             block_ids = new_block_ids[i]
             if not block_ids and not overwrite:
@@ -141,6 +153,34 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+
+    def append_new_block_ids(
+        self, req_indices: list[int], new_block_ids: list[tuple[list[int], ...]]
+    ) -> None:
+        """append_block_ids(overwrite=False) for several requests at once. With
+        many groups (kvpress per-layer / per-head paging) most get no new block in
+        a step, so only the others are staged, with numpy across all requests."""
+        if self.fused_writer is None or self.redirect_writes_to_null_block:
+            for req_index, block_ids in zip(req_indices, new_block_ids):
+                self.append_block_ids(req_index, block_ids, overwrite=False)
+            return
+        rows: list[int] = []
+        groups: list[int] = []
+        contents: list[list[int]] = []
+        for req_index, block_ids in zip(req_indices, new_block_ids):
+            req_groups = list(itertools.compress(range(len(block_ids)), block_ids))
+            rows += [req_index] * len(req_groups)
+            groups += req_groups
+            contents += [block_ids[i] for i in req_groups]
+        if not groups:
+            return
+        num_blocks = self.num_blocks.np
+        starts = num_blocks[groups, rows]
+        ends = starts + np.fromiter(map(len, contents), np.int64, len(contents))
+        if (ends > self.max_num_blocks_np[groups]).any():
+            raise RuntimeError("Block table write exceeds row capacity")
+        num_blocks[groups, rows] = ends
+        self.fused_writer.stage_writes(groups, rows, starts.tolist(), contents)
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -165,9 +205,11 @@ class BlockTables:
     ) -> tuple[torch.Tensor, ...]:
         if self.num_kv_cache_groups == 0:
             return ()
+        views = None
         if out is None:
             out = tuple(self.input_block_tables)
             out_ptrs = self.input_block_table_ptrs
+            views = self.input_block_table_views.get(num_reqs_padded)
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
@@ -183,7 +225,12 @@ class BlockTables:
             num_reqs,
             BLOCK_SIZE=1024,  # type: ignore
         )
-        return tuple(bt[:num_reqs_padded] for bt in out)
+        if views is not None:
+            return views
+        views = tuple(bt[:num_reqs_padded] for bt in out)
+        if out_ptrs is self.input_block_table_ptrs:
+            self.input_block_table_views[num_reqs_padded] = views
+        return views
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.

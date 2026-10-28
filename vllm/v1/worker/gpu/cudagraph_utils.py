@@ -860,6 +860,18 @@ def prepare_inputs_to_capture(
         kv_cache_config,
         for_capture=full_cudagraph,
     )
+    if kvpress.per_head_paging():
+        assert block_tables.input_block_table_stack is not None
+        kvpress.set_step(
+            kvpress.make_step(
+                block_tables.input_block_table_stack,
+                slot_mappings,
+                input_batch.seq_lens,
+                input_batch.query_start_loc,
+                num_reqs,
+                num_tokens,
+            )
+        )
     return AttentionState(attn_metadata, slot_mappings_by_layer)
 
 

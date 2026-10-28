@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
+from vllm.v1 import kvpress
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
     resolve_hisparse_specs,
@@ -443,15 +444,37 @@ def init_kv_cache(
     return kv_caches
 
 
+# (slot_mappings address, shape, config) -> result. The runner passes views of
+# one persistent buffer, so with many groups (kvpress) the per-group slices are
+# only made once per batch size. Cached views keep their storage alive, so an
+# address cannot be reused by another tensor while its entry exists.
+_slot_mappings_by_layer_cache: dict[tuple, dict[str, torch.Tensor]] = {}
+
+
 def build_slot_mappings_by_layer(
     slot_mappings: torch.Tensor, kv_cache_config: KVCacheConfig
 ) -> dict[str, torch.Tensor]:
+    key = (
+        slot_mappings.data_ptr(),
+        tuple(slot_mappings.shape),
+        tuple(slot_mappings.stride()),
+        id(kv_cache_config),
+    )
+    cached = _slot_mappings_by_layer_cache.get(key)
+    if cached is not None:
+        return dict(cached)
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
-    for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
-        for layer_name in kv_cache_group.layer_names:
-            slot_mappings_by_layer[layer_name] = slot_mapping
-    return slot_mappings_by_layer
+    for i, kv_cache_group in enumerate(kv_cache_groups):
+        # kvpress per-head paging: only one group per layer lists the layer
+        if kv_cache_group.layer_names:
+            slot_mapping = slot_mappings[i]
+            for layer_name in kv_cache_group.layer_names:
+                slot_mappings_by_layer[layer_name] = slot_mapping
+    if len(_slot_mappings_by_layer_cache) >= 256:
+        _slot_mappings_by_layer_cache.clear()
+    _slot_mappings_by_layer_cache[key] = slot_mappings_by_layer
+    return dict(slot_mappings_by_layer)
 
 
 def build_attn_metadata(
@@ -499,9 +522,32 @@ def build_attn_metadata(
     # Also at capture, so FULL graphs share the batch-level buffers.
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    # kvpress per-head paging reads its per-head inputs from kvpress.make_step and
+    # only the batch sizes from the metadata, which every layer can share
+    shared_metadata = None
+    # kvpress per-layer paging: the layers' metadata differ only in KV lengths,
+    # block table and slot mapping, so later layers copy the first one's
+    layer_template: tuple[KVCacheSpec, type, Any] | None = None
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
             continue
+        if shared_metadata is not None:
+            for attn_group in attn_groups[i]:
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = shared_metadata
+            continue
+        if layer_template is not None and len(attn_groups[i]) == 1:
+            attn_group = attn_groups[i][0]
+            builder = attn_group.get_metadata_builder(ubatch_idx)
+            spec, builder_type, template = layer_template
+            if type(builder) is builder_type and attn_group.kv_cache_spec == spec:
+                metadata = builder.update_block_table(
+                    template, block_tables[i], slot_mappings[i]
+                )
+                metadata.seq_lens = seq_lens[i]
+                for layer_name in attn_group.layer_names:
+                    attn_metadata[layer_name] = metadata
+                continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
         # Per-group causal for hybrid drafters (mixed SWA/full attention).
@@ -579,6 +625,23 @@ def build_attn_metadata(
                 cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if kvpress.per_head_paging():
+                shared_metadata = metadata
+            elif (
+                layer_template is None
+                and seq_lens.dim() == 2
+                and len(attn_groups[i]) == 1
+                and attn_metadata_builder.supports_update_block_table
+                # FA3 AOT scheduling and DCP derive more fields from the lengths
+                and getattr(metadata, "scheduler_metadata", 0) is None
+                and getattr(metadata, "dcp_context_kv_lens", 0) is None
+                and kvpress.paging() == "layer"
+            ):
+                layer_template = (
+                    attn_group.kv_cache_spec,
+                    type(attn_metadata_builder),
+                    metadata,
+                )
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
 

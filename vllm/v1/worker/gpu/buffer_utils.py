@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 from collections.abc import Iterable, Sequence
 from functools import partial
 
@@ -247,6 +248,29 @@ class FusedStagedWriter:
         self.starts = new_pool(max_writes)
         self.cu_lens = new_pool(max_writes)
         self.device = device
+        # Writes staged directly (stage_writes), applied with the tensors' own
+        self._group_ids: list[int] = []
+        self._indices: list[int] = []
+        self._starts: list[int] = []
+        self._contents: list[int] = []
+        self._cu_lens: list[int] = []
+
+    def stage_writes(
+        self,
+        group_ids: list[int],
+        indices: list[int],
+        starts: list[int],
+        contents: list[list[int]],
+    ) -> None:
+        """Stage writes to rows `indices` of tensors `group_ids` at once, without
+        a Python call per tensor."""
+        self._group_ids.extend(group_ids)
+        self._indices.extend(indices)
+        self._starts.extend(starts)
+        # End offset of each write in the flat contents
+        ends = itertools.accumulate(map(len, contents), initial=len(self._contents))
+        self._cu_lens.extend(itertools.islice(ends, 1, None))
+        self._contents.extend(itertools.chain.from_iterable(contents))
 
     def apply(
         self,
@@ -254,18 +278,18 @@ class FusedStagedWriter:
         output_ptrs: torch.Tensor,
         output_strides: torch.Tensor,
     ) -> None:
-        """Apply and clear the staged writes of `tensors` with one kernel."""
-        group_ids: list[int] = []
-        indices: list[int] = []
-        starts: list[int] = []
-        contents: list[int | float] = []
-        cu_lens: list[int] = []
+        """Apply and clear the staged writes of `tensors` (and stage_writes)
+        with one kernel."""
+        group_ids: list[int] = self._group_ids
+        indices: list[int] = self._indices
+        starts: list[int] = self._starts
+        contents: list[int | float] = self._contents  # type: ignore[assignment]
+        cu_lens: list[int] = self._cu_lens
 
-        for group_id, t in enumerate(tensors):
+        # Most tensors have no write in a step under kvpress per-head paging
+        staged = [(g, t) for g, t in enumerate(tensors) if t._staged_write_indices]
+        for group_id, t in staged:
             n = len(t._staged_write_indices)
-            if n == 0:
-                continue
-
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
@@ -293,8 +317,10 @@ class FusedStagedWriter:
             BLOCK_SIZE=1024,
             MULTI_GROUP=True,
         )
-        for t in tensors:
+        for _, t in staged:
             t.clear_staged_writes()
+        for staged_list in (group_ids, indices, starts, contents, cu_lens):
+            staged_list.clear()
 
 
 @triton.jit

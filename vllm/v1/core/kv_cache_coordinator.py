@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -87,6 +88,33 @@ def replay_boundaries(
     resend = (num_prompt_tokens - 1) // block * block
     extension = num_prompt_tokens // block * block
     return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+
+
+class SparseGroups(tuple):
+    """Per-group new blocks, plus the list of groups that got any (kvpress: most
+    groups get no new block in a step)."""
+
+    nonempty: list[int]
+
+    def __new__(cls, blocks: Sequence, nonempty: list[int]) -> "SparseGroups":
+        self = super().__new__(cls, blocks)
+        self.nonempty = nonempty
+        return self
+
+
+@dataclass
+class KvpressAlloc:
+    """State of one request in KVCacheCoordinator's vectorized allocation."""
+
+    num_evicted: Sequence[int]  # request.num_evicted_tokens it was built for
+    evicted: np.ndarray  # the same, per group
+    num_blocks: np.ndarray  # blocks per group
+    # Groups by evicted % block_size: group g's capacity in tokens,
+    # num_blocks * block_size + evicted, always has this residue
+    residues: list[tuple[np.ndarray, list[int]]] | None
+    # Every capacity is in [tight, tight + block_size), so token tight + 1 needs
+    # one block in exactly the groups of residue tight % block_size (-1: unknown)
+    tight: int = -1
 
 
 class KVCacheCoordinator(ABC):
@@ -194,10 +222,27 @@ class KVCacheCoordinator(ABC):
             and not enable_caching
             and len(self.single_type_managers) > 1
         )
-        # request_id -> blocks per group, for the vectorized allocation
-        self.kvpress_num_blocks: dict[str, np.ndarray] = {}
+        # request_id -> state of the vectorized allocation
+        self.kvpress_alloc: dict[str, KvpressAlloc] = {}
+        self.group_block_sizes_np = np.asarray(self.group_block_sizes, dtype=np.int64)
+        self.uniform_block_size = (
+            self.group_block_sizes[0] if len(set(self.group_block_sizes)) == 1 else 0
+        )
+        num_groups = len(self.single_type_managers)
+        self.kvpress_no_evicted = np.zeros(num_groups, dtype=np.int64)
+        self.kvpress_no_evicted_residues = self._groups_by_residue(
+            self.kvpress_no_evicted
+        )
+        # Key and result of the last general _kvpress_new_blocks call:
+        # allocate_new_blocks repeats the query get_num_blocks_to_allocate made
+        self.kvpress_last_need: tuple | None = None
         self.no_new_blocks: tuple[Sequence[KVCacheBlock], ...] = tuple(
             () for _ in self.single_type_managers
+        )
+        self.no_groups: tuple[np.ndarray, list[int], None] = (
+            np.zeros(0, dtype=np.int64),
+            [],
+            None,
         )
 
         # A positive retention interval must be a multiple of the base hit granularity
@@ -253,8 +298,10 @@ class KVCacheCoordinator(ABC):
 
         """
         if self.vectorized_allocation:
-            need = self._kvpress_new_blocks(request_id, num_tokens, num_evicted)
-            return int(need.sum())
+            _, groups, counts = self._kvpress_new_blocks(
+                request_id, num_tokens, num_evicted
+            )
+            return len(groups) if counts is None else sum(counts)
         num_blocks_to_allocate = 0
         if self.retention_interval != 0:
             prefill_end = 0
@@ -361,18 +408,7 @@ class KVCacheCoordinator(ABC):
 
         """
         if self.vectorized_allocation:
-            need = self._kvpress_new_blocks(request_id, num_tokens, num_evicted)
-            groups = np.flatnonzero(need).tolist()
-            if not groups:
-                return self.no_new_blocks
-            new_blocks: list[Sequence[KVCacheBlock]] = list(self.no_new_blocks)
-            for i in groups:
-                n = num_tokens - (num_evicted[i] if num_evicted else 0)
-                new_blocks[i] = self.single_type_managers[i].allocate_new_blocks(
-                    request_id, n, n
-                )
-            self.kvpress_num_blocks[request_id] += need
-            return tuple(new_blocks)  # type: ignore[arg-type]
+            return self._kvpress_allocate(request_id, num_tokens, num_evicted)
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
@@ -384,14 +420,24 @@ class KVCacheCoordinator(ABC):
             for i, manager in enumerate(self.single_type_managers)
         )
 
-    def _kvpress_new_blocks(
-        self, request_id: str, num_tokens: int, num_evicted: Sequence[int]
-    ) -> np.ndarray:
-        """Blocks each group still needs for `num_tokens` (full attention, no
-        prefix caching)."""
-        num_blocks = self.kvpress_num_blocks.get(request_id)
-        if num_blocks is None:
-            num_blocks = self.kvpress_num_blocks[request_id] = np.fromiter(
+    def _groups_by_residue(
+        self, evicted: np.ndarray
+    ) -> list[tuple[np.ndarray, list[int]]] | None:
+        """Groups by evicted % block_size, ascending (uniform block size only)."""
+        block_size = self.uniform_block_size
+        if not block_size:
+            return None
+        residue = evicted % block_size
+        order = np.argsort(residue, kind="stable")
+        bounds = np.searchsorted(residue[order], np.arange(1, block_size))
+        return [(g, g.tolist()) for g in np.split(order, bounds)]
+
+    def _kvpress_state(
+        self, request_id: str, num_evicted: Sequence[int]
+    ) -> KvpressAlloc:
+        state = self.kvpress_alloc.get(request_id)
+        if state is None or state.num_evicted is not num_evicted:
+            num_blocks = np.fromiter(
                 (
                     len(m.req_to_blocks.get(request_id, ()))
                     for m in self.single_type_managers
@@ -399,9 +445,97 @@ class KVCacheCoordinator(ABC):
                 dtype=np.int64,
                 count=len(self.single_type_managers),
             )
-        num_slots = num_tokens - np.asarray(num_evicted or 0, dtype=np.int64)
-        block_sizes = np.asarray(self.group_block_sizes, dtype=np.int64)
-        return np.maximum(-(-num_slots // block_sizes) - num_blocks, 0)
+            if num_evicted:
+                evicted = np.asarray(num_evicted, dtype=np.int64)
+                residues = self._groups_by_residue(evicted)
+            else:
+                evicted = self.kvpress_no_evicted
+                residues = self.kvpress_no_evicted_residues
+            state = KvpressAlloc(num_evicted, evicted, num_blocks, residues)
+            self.kvpress_alloc[request_id] = state
+        return state
+
+    def _kvpress_new_blocks(
+        self, request_id: str, num_tokens: int, num_evicted: Sequence[int]
+    ) -> tuple[np.ndarray, list[int], list[int] | None]:
+        """Groups that still need blocks for `num_tokens` slots (full attention,
+        no prefix caching), as an array and a list, and the number of blocks of
+        each (None: one each)."""
+        state = self._kvpress_state(request_id, num_evicted)
+        if num_tokens <= state.tight:
+            return self.no_groups
+        if state.tight >= 0 and num_tokens == state.tight + 1:
+            # Decode: one block for each group whose capacity is exactly `tight`
+            assert state.residues is not None
+            return *state.residues[state.tight % self.uniform_block_size], None
+        last = self.kvpress_last_need
+        if (
+            last is not None
+            and last[0] == request_id
+            and last[1] == num_tokens
+            and last[2] is state
+        ):
+            return last[3]
+        slots = num_tokens - state.evicted
+        need = np.maximum(
+            -(-slots // self.group_block_sizes_np) - state.num_blocks, 0
+        )
+        groups = np.flatnonzero(need)
+        result = groups, groups.tolist(), need[groups].tolist()
+        self.kvpress_last_need = (request_id, num_tokens, state, result)
+        return result
+
+    def _kvpress_allocate(
+        self, request_id: str, num_tokens: int, num_evicted: Sequence[int]
+    ) -> tuple[Sequence[KVCacheBlock], ...]:
+        """allocate_new_blocks of the vectorized allocation: one pool request for
+        all groups, then each group gets its share (what
+        FullAttentionManager.allocate_new_blocks does per group)."""
+        groups, group_list, counts = self._kvpress_new_blocks(
+            request_id, num_tokens, num_evicted
+        )
+        state = self.kvpress_alloc[request_id]
+        if not group_list:
+            if counts is None and num_tokens == state.tight + 1:
+                state.tight = num_tokens  # no group was at capacity
+            return self.no_new_blocks
+        blocks = self.block_pool.get_new_blocks(
+            len(group_list) if counts is None else sum(counts)
+        )
+        new_blocks: list[Sequence[KVCacheBlock]] = list(self.no_new_blocks)
+        managers = self.single_type_managers
+        if counts is None:  # one block each (decode)
+            for i, block in zip(group_list, blocks):
+                manager = managers[i]
+                manager.req_to_blocks[request_id].append(block)
+                if manager.records_new_block_ids:
+                    manager.new_block_ids.append(block.block_id)
+                new_blocks[i] = [block]
+        else:
+            start = 0
+            for i, n in zip(group_list, counts):
+                group_blocks = blocks[start : start + n]
+                start += n
+                manager = managers[i]
+                manager.req_to_blocks[request_id].extend(group_blocks)
+                if manager.records_new_block_ids:
+                    manager.new_block_ids.extend(b.block_id for b in group_blocks)
+                new_blocks[i] = group_blocks
+        self.kvpress_last_need = None
+        if counts is None:
+            state.num_blocks[groups] += 1
+            state.tight = num_tokens
+        else:
+            state.num_blocks[groups] += counts
+            # Capacities all in [num_tokens, num_tokens + block_size) again?
+            capacity = state.num_blocks * self.group_block_sizes_np + state.evicted
+            state.tight = (
+                num_tokens
+                if state.residues is not None
+                and (capacity < num_tokens + self.uniform_block_size).all()
+                else -1
+            )
+        return SparseGroups(new_blocks, group_list)
 
     def get_num_cacheable_tokens(
         self, num_computed_tokens: int, kv_cache_group_id: int
@@ -421,6 +555,8 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
 
         """
+        if self.vectorized_allocation:
+            return  # no prefix caching
         boundaries = replay_boundaries(
             request.num_prompt_tokens,
             self.scheduler_block_size,
@@ -464,7 +600,7 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
 
         """
-        self.kvpress_num_blocks.pop(request_id, None)
+        self.kvpress_alloc.pop(request_id, None)
         for manager in self.single_type_managers:
             manager.free(request_id)
 
@@ -482,7 +618,7 @@ class KVCacheCoordinator(ABC):
             The request's blocks in allocation order.
 
         """
-        self.kvpress_num_blocks.pop(request_id, None)
+        self.kvpress_alloc.pop(request_id, None)
         blocks: list[KVCacheBlock] = []
         for manager in self.single_type_managers:
             blocks.extend(manager.pop_blocks_for_free(request_id))

@@ -710,6 +710,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_config.get_num_kv_heads(self.parallel_config),
         )
         kvpress.init_attn_seq_lens(self.max_num_reqs, self.device)
+        if kvpress.per_head_paging():
+            assert self.block_tables.input_block_table_stack is not None
+            kvpress.init_step_buffers(
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.block_tables.input_block_table_stack.shape[-1],
+                self.device,
+            )
         # req_id -> kept KV count per group, reported to the scheduler.
         self.kvpress_num_kept: dict[str, list[int]] = {}
         self.pcp_manager = pcp.maybe_build_pcp_manager(
@@ -753,8 +761,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             piecewise_capture_available=piecewise_capture_available,
         )
         if kvpress.per_head_paging() and (
-            cudagraph_mode != CUDAGraphMode.NONE
-            or self.cache_config.cache_dtype != "auto"
+            self.cache_config.cache_dtype != "auto"
             or any(
                 g.backend.get_name() != "FLASH_ATTN"
                 for groups in self.attn_groups
@@ -762,8 +769,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         ):
             raise ValueError(
-                "VLLM_KVPRESS_PAGING=head needs enforce_eager=True, "
-                "kv_cache_dtype='auto' and the FLASH_ATTN backend"
+                "VLLM_KVPRESS_PAGING=head needs kv_cache_dtype='auto' and the "
+                "FLASH_ATTN backend"
             )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
@@ -1265,15 +1272,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        append_indices: list[int] = []
+        append_block_ids: list[tuple[list[int], ...]] = []
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:
-                self.block_tables.append_block_ids(
-                    req_index, req_new_block_ids, overwrite=False
-                )
+                append_indices.append(req_index)
+                append_block_ids.append(req_new_block_ids)
+        self.block_tables.append_new_block_ids(append_indices, append_block_ids)
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(
@@ -2030,8 +2039,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         slot_mappings,
                         attn_input_batch.seq_lens,
                         input_batch.query_start_loc,
-                        input_batch.num_reqs,
-                        input_batch.num_tokens,
+                        # A FULL graph replays the padded batch it was captured with
+                        *(
+                            (
+                                input_batch.num_reqs_after_padding,
+                                input_batch.num_tokens_after_padding,
+                            )
+                            if batch_desc.cg_mode == CUDAGraphMode.FULL
+                            else (input_batch.num_reqs, input_batch.num_tokens)
+                        ),
                     )
                 )
 
