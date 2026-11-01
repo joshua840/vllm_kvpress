@@ -35,7 +35,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.kvpress import scorers, triton_compact, triton_snapkv
+from vllm.v1.kvpress import scorers, triton_compact, triton_window_attention
 from vllm.v1.kvpress.scorers import query_window
 
 _ANY = ("shared", "layer", "head")
@@ -366,10 +366,10 @@ def set_step(step: StepContext | None) -> None:
 # Torch references (used in tests)
 
 
-def snapkv_scores(
+def window_attention_scores(
     queries: torch.Tensor, keys: torch.Tensor, window_size: int, kernel_size: int
 ) -> torch.Tensor:
-    """Torch reference of triton_snapkv.snapkv_scores.
+    """Torch reference of triton_window_attention.window_attention_scores.
 
     SnapKV scores for one request, matching kvpress SnapKVPress.score.
 

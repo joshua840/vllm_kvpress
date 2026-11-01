@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.kvpress import triton_snapkv
+from vllm.v1.kvpress import triton_window_attention
 
 EPSILON = 1e-12  # kvpress entropy_gated_chunkkv_press.py
 
@@ -168,11 +168,11 @@ def scores(
     """queries: the press's window, (query_window, num_heads, head_size), post-RoPE."""
     name = scorer_name(cfg)
     if name in ("snapkv", "pyramidkv"):
-        return triton_snapkv.snapkv_scores(
+        return triton_window_attention.window_attention_scores(
             queries, kv_cache, block_ids, seq_len, cfg.get("kernel_size", 5)
         )
     if name == "tova":
-        s = triton_snapkv.snapkv_scores(queries, kv_cache, block_ids, seq_len, 1)
+        s = triton_window_attention.window_attention_scores(queries, kv_cache, block_ids, seq_len, 1)
         s = s[:, :-1].mean(0).expand(kv_cache.shape[1], -1)
         return F.pad(s, (0, 1), value=s.max().item() + 1)
     keys, values = read_kv(kv_cache, block_ids, seq_len)
@@ -284,7 +284,7 @@ def simlayerkv_mask(
     )
     if threshold == 1.0 or seq_len <= n_initial + n_recent + n_last:
         return mask
-    s = triton_snapkv.snapkv_scores(queries, kv_cache, block_ids, seq_len, 1)
+    s = triton_window_attention.window_attention_scores(queries, kv_cache, block_ids, seq_len, 1)
     attn = s[:, :-n_last].mean(0)
     if (attn[:n_initial].sum() + attn[-n_recent:].sum()).item() > threshold:
         mask[:, n_initial : seq_len - n_recent + n_last] = False

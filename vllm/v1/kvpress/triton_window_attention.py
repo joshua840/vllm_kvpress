@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused SnapKV scoring that reads keys straight from the paged KV cache.
+"""Fused window attention scoring (SnapKV and the presses built on it) that reads
+keys straight from the paged KV cache.
 
 The torch reference gathers the keys, repeats them per query group, materializes the
 (heads, window, seq_len) attention matrix in fp32 and reduces it. Here two kernels
@@ -150,7 +151,7 @@ def _window_mean_kernel(
     tl.store(out_ptr + h * n_scored + n, tl.sum(p, axis=0) / WINDOW, mask=n < n_scored)
 
 
-def snapkv_scores(
+def window_attention_scores(
     queries: torch.Tensor,
     kv_cache: torch.Tensor,
     block_ids: torch.Tensor,
