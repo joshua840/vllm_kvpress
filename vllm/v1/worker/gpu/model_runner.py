@@ -1770,28 +1770,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if start + q_len != end:
                 continue
             window = cfg.get("window_size", 64)
-            if cfg.get("press") != "precomputed" and q_len < window:
+            if q_len < window:
                 raise NotImplementedError(
                     f"kvpress: the last prefill chunk ({q_len} tokens) must cover the "
                     f"observation window ({window} tokens)"
                 )
-            keep_mask = None
-            if cfg.get("press") == "precomputed":
-                keep_mask = torch.load(cfg["keep_path"]).to(self.device, torch.bool)
-                layout = kvpress._layout
-                assert layout is not None
-                expected = (layout.num_layers, layout.num_kv_heads, end)
-                if tuple(keep_mask.shape) != expected:
-                    raise ValueError(
-                        f"kvpress keep mask {tuple(keep_mask.shape)} != {expected}"
-                    )
             plan.append(
                 kvpress.PressEntry(
                     batch_idx=i,
                     query_end=int(input_batch.query_start_loc_np[i + 1]),
                     seq_len=end,
                     cfg=cfg,
-                    keep_mask=keep_mask,
                 )
             )
         return plan

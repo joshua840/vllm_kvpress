@@ -3,17 +3,14 @@
 """Post-prefill KV cache eviction (kvpress-style presses) for the V2 model runner.
 
 A request opts in with ``SamplingParams(extra_args={"kvpress": {...}})``:
-    press              "snapkv" (uniform), "pyramidkv" (per layer),
-                       "adakv" (per head, SnapKV scores) or
-                       "precomputed" (per head, keep mask from a file)
+    press              "snapkv" (uniform), "pyramidkv" (per layer) or
+                       "adakv" (per head, SnapKV scores)
     compression_ratio  fraction of the compressed span to evict (kvpress semantics)
     compress_len       leading prompt tokens to compress (default: the whole prompt)
     window_size        SnapKV observation window (default 64)
     kernel_size        SnapKV pooling kernel (default 5)
     beta               PyramidKV pyramid steepness (default 20)
     alpha_safeguard    AdaKV minimum kept fraction per head (default 0.2)
-    keep_path          precomputed: torch file with a bool keep mask
-                       (num_layers, num_kv_heads, compress_len)
 
 How much can differ is set once per engine by ``VLLM_KVPRESS_PAGING``:
     shared  one KV cache group for all layers (vLLM default): category A only
@@ -40,7 +37,6 @@ PRESS_PAGING = {
     "snapkv": ("shared", "layer", "head"),
     "pyramidkv": ("layer", "head"),
     "adakv": ("head",),
-    "precomputed": ("head",),
 }
 
 
@@ -71,7 +67,7 @@ def validate(sampling_params: Any, vllm_config: Any) -> None:
     unsupported = {
         f"press={cfg.get('press')} with tensor parallelism (each rank selects its "
         "own heads, but the scheduler frees blocks by rank 0's kept counts)":
-            cfg.get("press") in ("adakv", "precomputed")
+            cfg.get("press") == "adakv"
             and vllm_config.parallel_config.tensor_parallel_size > 1,
         "prefix caching (hashes of compressed blocks no longer match their tokens)":
             cache.enable_prefix_caching,
@@ -212,7 +208,6 @@ class PressEntry:
     query_end: int  # index after the last query token of this request in the flat batch
     seq_len: int  # KV length to compress (== compress_len)
     cfg: dict
-    keep_mask: torch.Tensor | None = None  # precomputed (layers, kv_heads, seq_len)
 
 
 @dataclass
@@ -436,25 +431,21 @@ def apply(
         else:
             block_ids = attn_metadata.block_table[e.batch_idx]
         press = e.cfg.get("press", "snapkv")
-        if press == "precomputed":
-            assert e.keep_mask is not None
-            keep, n_kept = mask_to_keep(e.keep_mask[layer_idx])
+        window = e.cfg.get("window_size", 64)
+        scores = triton_snapkv.snapkv_scores(
+            query[e.query_end - window : e.query_end],
+            kv_cache,
+            block_ids,
+            e.seq_len,
+            e.cfg.get("kernel_size", 5),
+        )
+        budget = layer_budget(e.cfg, e.seq_len, layer_idx, _layout.num_layers)
+        if press == "adakv":
+            mask = adakv_mask(scores, budget, e.cfg.get("alpha_safeguard", 0.2))
+            keep, n_kept = mask_to_keep(mask)
         else:
-            window = e.cfg.get("window_size", 64)
-            scores = triton_snapkv.snapkv_scores(
-                query[e.query_end - window : e.query_end],
-                kv_cache,
-                block_ids,
-                e.seq_len,
-                e.cfg.get("kernel_size", 5),
-            )
-            budget = layer_budget(e.cfg, e.seq_len, layer_idx, _layout.num_layers)
-            if press == "adakv":
-                mask = adakv_mask(scores, budget, e.cfg.get("alpha_safeguard", 0.2))
-                keep, n_kept = mask_to_keep(mask)
-            else:
-                keep = scores.topk(budget, dim=-1).indices.sort(dim=-1).values
-                n_kept = torch.full_like(keep[:, 0], budget, dtype=torch.int32)
+            keep = scores.topk(budget, dim=-1).indices.sort(dim=-1).values
+            n_kept = torch.full_like(keep[:, 0], budget, dtype=torch.int32)
         triton_compact.compact(kv_cache, block_ids, keep, n_kept)
         # Without per-head paging all heads of a layer share one group (and count)
         _kept[row, groups] = n_kept if len(groups) > 1 else n_kept[:1]
