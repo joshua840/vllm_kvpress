@@ -3,14 +3,18 @@
 """Post-prefill KV cache eviction (kvpress-style presses) for the V2 model runner.
 
 A request opts in with ``SamplingParams(extra_args={"kvpress": {...}})``:
-    press              "snapkv" (uniform), "pyramidkv" (per layer) or
-                       "adakv" (per head, SnapKV scores)
+    press              a key of PRESS_PAGING
+    scorer             scorer of a wrapper press (adakv, chunk, block, chunkkv,
+                       entropy_gated_chunkkv, per_layer), default snapkv
     compression_ratio  fraction of the compressed span to evict (kvpress semantics)
+    compression_ratios per_layer: one ratio per layer
     compress_len       leading prompt tokens to compress (default: the whole prompt)
     window_size        SnapKV observation window (default 64)
     kernel_size        SnapKV pooling kernel (default 5)
     beta               PyramidKV pyramid steepness (default 20)
     alpha_safeguard    AdaKV minimum kept fraction per head (default 0.2)
+    chunk_length, block_size, seed, n_sink, lag_size, lazy_threshold, ...
+                       same names and defaults as the kvpress press
 
 How much can differ is set once per engine by ``VLLM_KVPRESS_PAGING``:
     shared  one KV cache group for all layers (vLLM default): category A only
@@ -31,13 +35,25 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.kvpress import triton_compact, triton_snapkv
+from vllm.v1.kvpress import scorers, triton_compact, triton_snapkv
+from vllm.v1.kvpress.scorers import query_window
 
+_ANY = ("shared", "layer", "head")
 PRESS_PAGING = {
-    "snapkv": ("shared", "layer", "head"),
+    **dict.fromkeys(scorers.SCORERS, _ANY),
+    "chunk": _ANY,
+    "block": _ANY,
+    "entropy_gated_chunkkv": _ANY,
+    # Kept counts differ across layers
     "pyramidkv": ("layer", "head"),
+    "per_layer": ("layer", "head"),
+    "chunkkv": ("layer", "head"),
+    "simlayerkv": ("layer", "head"),
+    # Kept counts differ across heads
     "adakv": ("head",),
 }
+# Kept counts depend on the heads a rank holds
+_SINGLE_RANK = ("adakv", "chunkkv", "simlayerkv")
 
 
 def paging() -> str:
@@ -47,14 +63,25 @@ def paging() -> str:
 def get_config(sampling_params: Any) -> dict | None:
     extra_args = getattr(sampling_params, "extra_args", None) or {}
     cfg = extra_args.get("kvpress")
-    if not cfg or cfg.get("compression_ratio", 0.0) <= 0:
+    if not cfg:
         return None
     press = cfg.get("press", "snapkv")
+    if not (
+        (cfg.get("compression_ratio") or 0.0) > 0
+        or any(cfg.get("compression_ratios") or ())
+        or press == "simlayerkv"
+    ):
+        return None
     if paging() not in PRESS_PAGING.get(press, ()):
         raise ValueError(
             f"kvpress press {press!r} needs VLLM_KVPRESS_PAGING in "
             f"{PRESS_PAGING.get(press)}, got {paging()!r}"
         )
+    name = scorers.scorer_name(cfg)
+    if press in scorers.WRAPPERS and name not in (
+        scorers.KV_SCORERS if press in ("chunk", "block") else scorers.SCORERS
+    ):
+        raise ValueError(f"kvpress press {press!r} cannot wrap scorer {name!r}")
     return cfg
 
 
@@ -67,7 +94,7 @@ def validate(sampling_params: Any, vllm_config: Any) -> None:
     unsupported = {
         f"press={cfg.get('press')} with tensor parallelism (each rank selects its "
         "own heads, but the scheduler frees blocks by rank 0's kept counts)":
-            cfg.get("press") == "adakv"
+            cfg.get("press") in _SINGLE_RANK
             and vllm_config.parallel_config.tensor_parallel_size > 1,
         "prefix caching (hashes of compressed blocks no longer match their tokens)":
             cache.enable_prefix_caching,
@@ -410,6 +437,44 @@ def mask_to_keep(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return keep, mask.sum(dim=-1, dtype=torch.int32)
 
 
+def select(
+    cfg: dict,
+    queries: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    seq_len: int,
+    layer_idx: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One request's kept KV pairs in one layer: (keep, n_kept) for compact."""
+    assert _layout is not None
+    press = cfg.get("press", "snapkv")
+    if press == "per_layer":
+        press = scorers.scorer_name(cfg)
+        ratio = cfg["compression_ratios"][layer_idx]
+        cfg = cfg | {"press": press, "compression_ratio": ratio}
+    if press == "simlayerkv":
+        return mask_to_keep(
+            scorers.simlayerkv_mask(cfg, queries, kv_cache, block_ids, seq_len)
+        )
+    budget = layer_budget(cfg, seq_len, layer_idx, _layout.num_layers)
+    if press in ("chunk", "block"):
+        keys, values = scorers.read_kv(kv_cache, block_ids, seq_len)
+        if press == "chunk":
+            keep = scorers.chunk_keep(cfg, keys, values)
+        else:
+            keep = scorers.block_keep(cfg, keys, values, max(1, budget))
+    else:
+        s = scorers.scores(cfg, queries, kv_cache, block_ids, seq_len)
+        if press == "adakv":
+            return mask_to_keep(adakv_mask(s, budget, cfg.get("alpha_safeguard", 0.2)))
+        if press == "chunkkv":
+            return mask_to_keep(scorers.chunkkv_mask(cfg, s))
+        if press == "entropy_gated_chunkkv":
+            return mask_to_keep(scorers.entropy_gated_chunkkv_mask(cfg, s))
+        keep = s.topk(budget, dim=-1).indices.sort(dim=-1).values
+    return keep, torch.full_like(keep[:, 0], keep.shape[1], dtype=torch.int32)
+
+
 def apply(
     layer: torch.nn.Module,
     query: torch.Tensor,
@@ -430,22 +495,15 @@ def apply(
             block_ids = _step.request_block_tables(layer_idx, e.batch_idx)
         else:
             block_ids = attn_metadata.block_table[e.batch_idx]
-        press = e.cfg.get("press", "snapkv")
-        window = e.cfg.get("window_size", 64)
-        scores = triton_snapkv.snapkv_scores(
+        window = query_window(e.cfg)
+        keep, n_kept = select(
+            e.cfg,
             query[e.query_end - window : e.query_end],
             kv_cache,
             block_ids,
             e.seq_len,
-            e.cfg.get("kernel_size", 5),
+            layer_idx,
         )
-        budget = layer_budget(e.cfg, e.seq_len, layer_idx, _layout.num_layers)
-        if press == "adakv":
-            mask = adakv_mask(scores, budget, e.cfg.get("alpha_safeguard", 0.2))
-            keep, n_kept = mask_to_keep(mask)
-        else:
-            keep = scores.topk(budget, dim=-1).indices.sort(dim=-1).values
-            n_kept = torch.full_like(keep[:, 0], budget, dtype=torch.int32)
         triton_compact.compact(kv_cache, block_ids, keep, n_kept)
         # Without per-head paging all heads of a layer share one group (and count)
         _kept[row, groups] = n_kept if len(groups) > 1 else n_kept[:1]

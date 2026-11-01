@@ -2047,7 +2047,7 @@ class Scheduler(SchedulerInterface):
         if request.kvpress is None or request.num_evicted_tokens:
             return num_new_tokens
         end = kvpress.compress_len(request.kvpress, request.num_prompt_tokens)
-        window_start = end - request.kvpress.get("window_size", 64)
+        window_start = end - kvpress.query_window(request.kvpress)
         chunk_end = num_computed_tokens + num_new_tokens
         if num_computed_tokens >= end or chunk_end <= window_start:
             return num_new_tokens

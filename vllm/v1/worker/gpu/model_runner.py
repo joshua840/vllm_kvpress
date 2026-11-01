@@ -1769,7 +1769,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             q_len = int(input_batch.num_scheduled_tokens[i])
             if start + q_len != end:
                 continue
-            window = cfg.get("window_size", 64)
+            window = kvpress.query_window(cfg)
             if q_len < window:
                 raise NotImplementedError(
                     f"kvpress: the last prefill chunk ({q_len} tokens) must cover the "
